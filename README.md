@@ -1,9 +1,11 @@
-Sure, I'll provide a README and a LICENSE file. The README will explain the project and the usage of the FileEditor application, and the LICENSE will be a standard MIT License.
 
 ### README.md
 
 ```markdown
-# FileEditor
+# spark
+
+file:///home/hp/Desktop/proects/onlinelogomaker-123124-2228-6169.eps
+
 
 ## Overview
 FileEditor is a desktop application built using PyQt6 that provides a file editor interface. It allows users to navigate the file system, view and edit text files, and manage quick action cards for common tasks. Quick action cards are stored in a SQLite database and can be created, edited, and deleted within the application.
