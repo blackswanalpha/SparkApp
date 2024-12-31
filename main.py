@@ -1,5 +1,9 @@
 import sys
 import os
+import subprocess
+import pty
+import threading
+import select
 import sqlite3
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTreeView, QVBoxLayout, QWidget,
@@ -7,9 +11,195 @@ from PyQt6.QtWidgets import (
     QSplitter, QDialog, QDialogButtonBox, QLabel, QLineEdit, QFormLayout,
     QMessageBox, QScrollArea, QSplashScreen, QFrame, QComboBox
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QRegularExpression
-from PyQt6.QtGui import QFont, QFileSystemModel, QPixmap, QSyntaxHighlighter, QTextCharFormat, QColor
+from PyQt6.QtCore import Qt, QSize, QTimer, QRegularExpression, QObject, pyqtSignal
+from PyQt6.QtGui import QFont, QFileSystemModel, QPixmap, QSyntaxHighlighter, QTextCharFormat, QColor, QTextCursor
 
+
+class TerminalOutputReader(QObject):
+    """
+    A thread-safe reader for terminal output that uses Qt's signal/slot mechanism
+    to safely update the GUI from a background thread.
+    """
+    # Define a signal for new output
+    outputReceived = pyqtSignal(str)
+
+    def __init__(self, master_fd):
+        """Initialize the output reader with the master file descriptor."""
+        super().__init__()
+        self.master_fd = master_fd
+        self.running = True
+
+    def read_output(self):
+        """
+        Continuously read output from the terminal and emit it through a signal.
+        This method runs in a separate thread.
+        """
+        while self.running:
+            try:
+                # Check for available data with a timeout
+                r, _, _ = select.select([self.master_fd], [], [], 0.1)
+                if r:
+                    # Read available data
+                    output = os.read(self.master_fd, 1024).decode()
+                    # Emit the output through the signal
+                    self.outputReceived.emit(output)
+            except (OSError, UnicodeDecodeError) as e:
+                # Handle potential errors during reading
+                if self.running:  # Only emit error if we're still supposed to be running
+                    self.outputReceived.emit(f"\nError reading output: {str(e)}\n")
+                break
+
+    def stop(self):
+        """Safely stop the output reader."""
+        self.running = False
+
+
+class TerminalEmulator(QWidget):
+    """
+    A thread-safe terminal emulator widget that provides a Unix-like shell interface.
+    Uses Qt's event system to safely handle communication between the GUI and shell process.
+    """
+
+    def __init__(self, parent=None):
+        """Initialize the terminal emulator with proper thread safety."""
+        super().__init__(parent)
+        self.setup_terminal()
+        self.start_shell()
+
+    def setup_terminal(self):
+        """Configure the terminal interface with thread-safe components."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create output display area
+        self.terminal_output = QTextEdit()
+        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setFont(QFont("Consolas", 11))
+        self.terminal_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #ffffff;
+                border: 2px solid #e9ecef;
+               
+                margin:20px;
+                padding: 8px;
+            }
+        """)
+
+        # Create command input line
+        self.command_input = QLineEdit()
+        self.command_input.setFont(QFont("Consolas", 11))
+        self.command_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #2D2D2D;
+                color: #FFFFFF;
+                border: none;
+                padding: 8px;
+            }
+        """)
+        self.command_input.returnPressed.connect(self.execute_command)
+
+        # Add prompt label
+        self.prompt_label = QLabel("$ ")
+        self.prompt_label.setStyleSheet("color: #00FF00;")
+
+        # Create command input layout
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(self.prompt_label)
+        input_layout.addWidget(self.command_input)
+
+        # Assemble the terminal layout
+        layout.addWidget(self.terminal_output)
+        layout.addLayout(input_layout)
+
+    def start_shell(self):
+        """Initialize the shell process with proper thread handling."""
+        try:
+            # Create pseudo-terminal
+            master_fd, slave_fd = pty.openpty()
+
+            # Start shell process
+            self.shell_process = subprocess.Popen(
+                os.environ.get('SHELL', '/bin/bash'),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                preexec_fn=os.setsid
+            )
+
+            # Close slave file descriptor
+            os.close(slave_fd)
+
+            # Store master file descriptor
+            self.master_fd = master_fd
+
+            # Create and configure output reader
+            self.output_reader = TerminalOutputReader(self.master_fd)
+            self.output_reader.outputReceived.connect(self.update_terminal_output)
+
+            # Start reader thread
+            self.reader_thread = threading.Thread(target=self.output_reader.read_output)
+            self.reader_thread.daemon = True
+            self.reader_thread.start()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Terminal Error", f"Failed to start terminal: {str(e)}")
+
+    def update_terminal_output(self, output):
+        """
+        Update the terminal output in a thread-safe way.
+        This slot is automatically called in the GUI thread.
+        """
+        try:
+            self.terminal_output.insertPlainText(output)
+            # Scroll to bottom
+            cursor = self.terminal_output.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.terminal_output.setTextCursor(cursor)
+        except RuntimeError:
+            # Widget has been deleted, stop the reader
+            self.cleanup()
+
+    def execute_command(self):
+        """Execute the command in a thread-safe manner."""
+        try:
+            command = self.command_input.text()
+            if command.strip():
+                # Display command in output
+                self.terminal_output.append(f"$ {command}")
+
+                # Send command to shell
+                os.write(self.master_fd, (command + '\n').encode())
+
+                # Clear input line
+                self.command_input.clear()
+        except OSError as e:
+            self.terminal_output.append(f"\nError executing command: {str(e)}\n")
+
+    def cleanup(self):
+        """
+        Clean up resources safely.
+        This method ensures proper shutdown of threads and processes.
+        """
+        if hasattr(self, 'output_reader'):
+            self.output_reader.stop()
+
+        if hasattr(self, 'shell_process'):
+            try:
+                self.shell_process.terminate()
+                self.shell_process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.shell_process.kill()
+
+        if hasattr(self, 'master_fd'):
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+
+    def closeEvent(self, event):
+        """Handle the terminal widget's close event safely."""
+        self.cleanup()
+        super().closeEvent(event)
 
 class CodeSyntaxHighlighter(QSyntaxHighlighter):
     """
@@ -164,7 +354,7 @@ class FileEditor(QMainWindow):
         super().__init__()
         self.setWindowTitle("SPARK")
         self.setGeometry(300, 150, 1000, 600)
-        self.setMinimumSize(QSize(800, 600))
+        self.setMinimumSize(QSize(1200, 700))
 
         self.current_file_path = None
         self.conn = sqlite3.connect('quick_actions.db')
@@ -182,80 +372,202 @@ class FileEditor(QMainWindow):
         self.create_toolbar()
         self.create_status_bar()
         self.create_main_layout()
+        # Modern UI stylesheet with a clean, professional design
         self.setStyleSheet("""
-         QMainWindow {
-                background-color: #f8f9fa;
-            }
-            QToolBar {
-                background-color: #ffffff;
-                border-bottom: 2px solid #e9ecef;
-                padding: 8px;
-                spacing: 10px;
-            }
-            QStatusBar {
-                background-color: #ffffff;
-                border-top: 2px solid #e9ecef;
-                color: #6c757d;
-            }
-            QTreeView {
-                background-color: #ffffff;
-                border: none;
-                border-right: 2px solid #e9ecef;
-                padding: 5px;
-            }
-            QTreeView::item {
-                padding: 5px;
-                border-radius: 4px;
-            }
-            QTreeView::item:selected {
-                background-color: #e9ecef;
-                color: #212529;
-            }
-            QTextEdit {
-                background-color: #ffffff;
-                border: none;
-                padding: 10px;
-                font-family: 'Consolas', monospace;
-                font-size: 14px;
-                line-height: 1.5;
-            }
-            QPushButton {
-                background-color: #0d6efd;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #0b5ed7;
-            }
-            QPushButton#deleteButton {
-                background-color: #dc3545;
-            }
-            QPushButton#deleteButton:hover {
-                background-color: #bb2d3b;
-            }
-            QLineEdit {
-                padding: 8px;
-                border: 2px solid #e9ecef;
-                border-radius: 4px;
-                background-color: white;
-            }
-            QLineEdit:focus {
-                border-color: #0d6efd;
-            }
-            QLabel {
-                color: #212529;
-                font-size: 14px;
-            }
-            QLabel#headerLabel {
-                font-size: 18px;
-                font-weight: bold;
-                color: #212529;
-                padding: 10px;
-            }
-        """)
+                /* Main Window - Creating a clean base */
+                QMainWindow {
+                    background-color: #f5f6fa;
+                }
+
+                /* Toolbar - Elevated design with subtle shadow */
+                QToolBar {
+                    background-color: #ffffff;
+                    border-bottom: 1px solid #e1e4e8;
+                    padding: 10px;
+                    spacing: 15px;
+                }
+
+                /* Status Bar - Minimal design */
+                QStatusBar {
+                    background-color: #ffffff;
+                    border-top: 1px solid #e1e4e8;
+                    color: #586069;
+                    padding: 5px;
+                }
+
+                /* Tree View - Modern file explorer */
+                QTreeView {
+                    background-color: #ffffff;
+                    border: none;
+                    border-right: 1px solid #e1e4e8;
+                    padding: 8px;
+                    margin: 0px;
+                    font-size: 14px;
+                }
+                QTreeView::item {
+                    padding: 8px;
+                    border-radius: 6px;
+                    margin: 2px 0px;
+                }
+                QTreeView::item:selected {
+                    background-color: #f1f8ff;
+                    color: #0366d6;
+                    font-weight: bold;
+                }
+                QTreeView::item:hover {
+                    background-color: #f6f8fa;
+                }
+
+                /* Text Editor - Clean and focused design */
+                QTextEdit {
+                    background-color: #ffffff;
+                    border: none;
+                    padding: 15px;
+                    selection-background-color: #0366d6;
+                    selection-color: white;
+                    font-family: 'Consolas', monospace;
+                    font-size: 14px;
+                    line-height: 1.6;
+                }
+
+                /* Buttons - Modern, flat design */
+                QPushButton {
+                    background-color: #0366d6;
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 6px;
+                    font-weight: bold;
+                    font-size: 13px;
+                    min-width: 80px;
+                }
+                QPushButton:hover {
+                    background-color: #0255b3;
+                }
+                QPushButton:pressed {
+                    background-color: #024494;
+                }
+                QPushButton#deleteButton {
+                    background-color: #ea4aaa;
+                }
+                QPushButton#deleteButton:hover {
+                    background-color: #d03592;
+                }
+
+                /* Search Bar and Line Edits - Modern input fields */
+                QLineEdit {
+                    padding: 10px;
+                    border: 2px solid #e1e4e8;
+                    border-radius: 6px;
+                    background-color: white;
+                    font-size: 13px;
+                    min-width: 200px;
+                }
+                QLineEdit:focus {
+                    border-color: #0366d6;
+                    background-color: #f8fafd;
+                }
+
+                /* Labels - Clear typography */
+                QLabel {
+                    color: #24292e;
+                    font-size: 14px;
+                    padding: 2px;
+                }
+                QLabel#headerLabel {
+                    font-size: 20px;
+                    font-weight: bold;
+                    color: #24292e;
+                    padding: 15px 10px;
+                }
+
+                /* Quick Action Cards - Elevated card design */
+                QWidget[class="card"] {
+                    background-color: white;
+                    border: 1px solid #e1e4e8;
+                    border-radius: 10px;
+                    padding: 15px;
+                    margin: 10px;
+                }
+                QWidget[class="card"]:hover {
+                    border-color: #0366d6;
+                    background-color: #f8fafd;
+                }
+
+                /* Scroll Area - Clean scrolling experience */
+                QScrollArea {
+                    background-color: #f5f6fa;
+                    border: none;
+                    padding: 5px;
+                }
+                QScrollBar:vertical {
+                    border: none;
+                    background: #f5f6fa;
+                    width: 10px;
+                    margin: 0px;
+                }
+                QScrollBar::handle:vertical {
+                    background-color: #c1c8d1;
+                    border-radius: 5px;
+                    min-height: 20px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background-color: #a8b1bd;
+                }
+
+                /* Combo Box - Modern dropdown */
+                QComboBox {
+                    background-color: white;
+                    border: 2px solid #e1e4e8;
+                    border-radius: 6px;
+                    padding: 8px;
+                    min-width: 150px;
+                    font-size: 13px;
+                }
+                QComboBox:hover {
+                    border-color: #0366d6;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    width: 20px;
+                }
+                QComboBox::down-arrow {
+                    image: none;
+                    border-left: 5px solid transparent;
+                    border-right: 5px solid transparent;
+                    border-top: 5px solid #586069;
+                }
+
+                /* Dialog Windows - Consistent styling */
+                QDialog {
+                    background-color: white;
+                    border-radius: 10px;
+                }
+                QDialog QLabel {
+                    font-size: 14px;
+                    color: #24292e;
+                }
+
+                /* Splitter - Refined separators */
+                QSplitter::handle {
+                    background-color: #e1e4e8;
+                }
+                QSplitter::handle:horizontal {
+                    width: 1px;
+                }
+                QSplitter::handle:vertical {
+                    height: 1px;
+                }
+
+                /* Terminal styling */
+                QWidget#terminal {
+                    background-color: #ffffff;
+                    border: 1px solid #e1e4e8;
+                    border-radius: 6px;
+                    margin: 10px;
+                    padding: 10px;
+                }
+            """)
 
     def connect_to_database(self):
         try:
@@ -295,6 +607,9 @@ class FileEditor(QMainWindow):
 
     def create_main_layout(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setSizes([200, 600, 250])  # Example: Set initial sizes for each pane
         self.create_file_system_view(splitter)
@@ -302,6 +617,17 @@ class FileEditor(QMainWindow):
         self.create_quick_action_pane(splitter)
         splitter.setSizes([200, 500, 350])  # Example: Set initial sizes for each pane
         layout.addWidget(splitter)
+
+        # Create vertical splitter for editor and terminal
+        v_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Add terminal
+        terminal = TerminalEmulator()
+        terminal.setMaximumHeight(250)
+        v_splitter.addWidget(terminal)
+        # Set initial vertical sizes (editor larger than terminal)
+        v_splitter.setSizes([200])
+        layout.addWidget(v_splitter)
 
         container = QWidget()
         container.setLayout(layout)
@@ -337,18 +663,18 @@ class FileEditor(QMainWindow):
         layout.addWidget(self.editor)
 
         # Add header with language selector
-        header_layout = QHBoxLayout()
-        header = QLabel("Editor")
-        header.setObjectName("headerLabel")
-        header_layout.addWidget(header)
-
-        # Add language selector
-        self.language_selector = QComboBox()
-        self.language_selector.addItems(['Plain Text', 'Python', 'JavaScript'])
-        self.language_selector.currentTextChanged.connect(self.change_language)
-        header_layout.addWidget(self.language_selector)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
+        # header_layout = QHBoxLayout()
+        # header = QLabel("Editor")
+        # header.setObjectName("headerLabel")
+        # header_layout.addWidget(header)
+        #
+        # # Add language selector
+        # self.language_selector = QComboBox()
+        # self.language_selector.addItems(['Plain Text', 'Python', 'JavaScript'])
+        # self.language_selector.currentTextChanged.connect(self.change_language)
+        # header_layout.addWidget(self.language_selector)
+        # header_layout.addStretch()
+        # layout.addLayout(header_layout)
 
         parent_splitter.addWidget(editor_widget)
 
